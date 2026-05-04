@@ -12,36 +12,19 @@
 /* Cached init_process pointer for use by other detection routines */
 static void *wx_init_process = NULL;
 
-/* ========== Safe symbol lookup (vmlinux only, no module traversal) ========== */
-
-struct lookup_data {
-    const char *name;
-    unsigned long addr;
-};
-
-static int lookup_callback(void *data, const char *name, struct module *mod, unsigned long addr)
-{
-    struct lookup_data *ld = data;
-    if (strcmp(name, ld->name) == 0) {
-        ld->addr = addr;
-        return 1; /* stop iteration */
-    }
-    return 0;
-}
+/* ========== Symbol lookup ========== */
 
 /*
- * Safe symbol lookup - only searches vmlinux symbols, never modules.
- * This avoids potential hangs when module_kallsyms_lookup_name
- * traverses the kernel module list.
+ * Use KernelPatch framework's kallsyms_lookup_name directly.
+ * Original code used kallsyms_on_each_symbol which iterates ALL symbols
+ * for each lookup (~40 lookups x ~100K symbols = millions of iterations).
+ * On kernel 6.6 this caused kernel crash / memory corruption.
+ * kallsyms_lookup_name is a direct hash lookup — fast and proven safe
+ * (ptehooker uses it without issues on the same device).
  */
 static unsigned long lookup_name_safe(const char *name)
 {
-    struct lookup_data ld = { .name = name, .addr = 0 };
-
-    if (kallsyms_on_each_symbol) {
-        kallsyms_on_each_symbol(lookup_callback, &ld);
-    }
-    return ld.addr;
+    return (unsigned long)kallsyms_lookup_name(name);
 }
 
 /* ========== Symbol resolution macros ========== */
@@ -65,7 +48,7 @@ static unsigned long lookup_name_safe(const char *name)
 
 int resolve_symbols(void)
 {
-    pr_info("wxshadow: resolving symbols...\n");
+    pr_info("wxshadow: >>> resolve_symbols BEGIN\n");
 
     /* ===== Memory management (all exported) ===== */
     pr_info("wxshadow: [1/12] mm functions...\n");
@@ -380,53 +363,29 @@ int resolve_symbols(void)
     /* copy_from_user removed: PATCH uses PTE walk instead (see copy_from_user_via_pte) */
 
     /* ===== Page fault handler (optional) ===== */
-    /*
-     * Use lookup_name_safe() to avoid module traversal hang.
-     * kallsyms_lookup_name() calls module_kallsyms_lookup_name() when
-     * symbol is not found in vmlinux, which can hang on some kernels.
-     */
-    pr_info("wxshadow: [13/14] page fault handler (safe lookup)...\n");
+    pr_info("wxshadow: [13/16] page fault handler BEGIN...\n");
     kfunc_do_page_fault = (void *)lookup_name_safe("do_page_fault");
-    if (!kfunc_do_page_fault) {
-        /* Try alternative names used in different kernel versions */
+    if (!kfunc_do_page_fault)
         kfunc_do_page_fault = (void *)lookup_name_safe("__do_page_fault");
-    }
-    if (!kfunc_do_page_fault) {
+    if (!kfunc_do_page_fault)
         kfunc_do_page_fault = (void *)lookup_name_safe("do_mem_abort");
-    }
-    if (!kfunc_do_page_fault) {
-        pr_warn("wxshadow: page fault handler not found, read hiding disabled\n");
-    } else {
-        pr_info("wxshadow: page fault handler found at %px\n", kfunc_do_page_fault);
-    }
+    pr_info("wxshadow: [13/16] page fault handler = %px\n", kfunc_do_page_fault);
 
-    /* follow_page_pte for GUP hiding (/proc/pid/mem, process_vm_readv, ptrace) */
-    pr_info("wxshadow: [14/14] follow_page_pte (GUP hiding)...\n");
+    /* follow_page_pte for GUP hiding */
+    pr_info("wxshadow: [14/16] follow_page_pte BEGIN...\n");
     kfunc_follow_page_pte = (void *)lookup_name_safe("follow_page_pte");
-    if (kfunc_follow_page_pte) {
-        pr_info("wxshadow: follow_page_pte found at %px\n", kfunc_follow_page_pte);
-    } else {
-        pr_warn("wxshadow: follow_page_pte not found, GUP hiding disabled\n");
-    }
+    pr_info("wxshadow: [14/16] follow_page_pte = %px\n", kfunc_follow_page_pte);
 
-    /* dup_mmap for precise fork protection (real mm duplication only) */
+    /* dup_mmap for fork protection */
+    pr_info("wxshadow: [15/16] dup_mmap BEGIN...\n");
     kfunc_dup_mmap = (void *)lookup_name_safe("dup_mmap");
-    if (kfunc_dup_mmap) {
-        pr_info("wxshadow: dup_mmap found at %px\n", kfunc_dup_mmap);
-    } else {
-        pr_warn("wxshadow: dup_mmap not found, trying uprobe_dup_mmap\n");
-    }
+    pr_info("wxshadow: [15/16] dup_mmap = %px\n", kfunc_dup_mmap);
 
+    pr_info("wxshadow: [16/16] uprobe_dup_mmap BEGIN...\n");
     kfunc_uprobe_dup_mmap = (void *)lookup_name_safe("uprobe_dup_mmap");
-    if (kfunc_uprobe_dup_mmap) {
-        pr_info("wxshadow: uprobe_dup_mmap found at %px\n", kfunc_uprobe_dup_mmap);
-    } else {
-        pr_warn("wxshadow: uprobe_dup_mmap not found\n");
-    }
+    pr_info("wxshadow: [16/16] uprobe_dup_mmap = %px\n", kfunc_uprobe_dup_mmap);
 
-    /* init_task already resolved above via kallsyms */
-
-    pr_info("wxshadow: all symbols resolved successfully\n");
+    pr_info("wxshadow: <<< resolve_symbols END (all OK)\n");
     return 0;
 }
 
@@ -485,7 +444,7 @@ int scan_vma_struct_offsets(void)
     int i;
     int found = 0;
 
-    pr_info("wxshadow: scanning vm_area_struct offsets...\n");
+    pr_info("wxshadow: >>> scan_vma_struct_offsets BEGIN\n");
 
     /*
      * Use current task's mm to find vma offset.
@@ -497,9 +456,13 @@ int scan_vma_struct_offsets(void)
         goto use_default;
     }
 
-    /* First field of mm_struct is mmap (first VMA) */
-    if (!safe_read_ptr((unsigned long)mm, &vma) || !vma) {
-        pr_warn("wxshadow: no VMA in current mm, using default offset\n");
+    /*
+     * Kernel 6.1+ uses maple tree; mm->mmap is gone.
+     * Use find_vma(mm, 0) to get an actual vm_area_struct.
+     */
+    vma = kfunc_find_vma(mm, 0);
+    if (!vma) {
+        pr_warn("wxshadow: find_vma(mm, 0) returned NULL, using default offset\n");
         kfunc_mmput(mm);
         goto use_default;
     }
@@ -527,11 +490,13 @@ int scan_vma_struct_offsets(void)
         goto use_default;
     }
 
+    pr_info("wxshadow: <<< scan_vma_struct_offsets END (found=%d, offset=0x%x)\n", found, vma_vm_mm_offset);
     return 0;
 
 use_default:
-    vma_vm_mm_offset = 0x40;
-    pr_info("wxshadow: using default vm_mm offset: 0x%x\n", vma_vm_mm_offset);
+    /* 0x10 is correct for kernel 6.1+ (maple tree), 0x40 for older kernels */
+    vma_vm_mm_offset = 0x10;
+    pr_info("wxshadow: <<< scan_vma_struct_offsets END (default offset=0x%x)\n", vma_vm_mm_offset);
     return 0;
 }
 
@@ -572,7 +537,7 @@ int detect_task_struct_offsets(void)
     int16_t comm_offset;
     int16_t active_mm_off;
 
-    pr_info("wxshadow: detecting task_struct offsets...\n");
+    pr_info("wxshadow: >>> detect_task_struct_offsets BEGIN\n");
 
     if (!wx_init_task) {
         pr_err("wxshadow: wx_init_task is NULL\n");
@@ -697,7 +662,7 @@ int detect_task_struct_offsets(void)
     pr_info("wxshadow: task_struct offsets: tasks=0x%x, mm=0x%x, comm=0x%x\n",
             task_struct_offset.tasks_offset, task_struct_offset.mm_offset,
             task_struct_offset.comm_offset);
-    pr_info("wxshadow: pid/tgid: using wxfunc(__task_pid_nr_ns)\n");
+    pr_info("wxshadow: <<< detect_task_struct_offsets END (OK)\n");
 
     return 0;
 }
