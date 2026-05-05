@@ -423,17 +423,18 @@ static void wxshadow_tlbi_page(void *mm, unsigned long uaddr)
 void wxshadow_flush_tlb_page(void *vma, unsigned long uaddr)
 {
     if (kfunc_flush_tlb_page) {
+        printk(KERN_EMERG "wxshadow: [tlb] using flush_tlb_page(%px, %lx)\n", vma, uaddr);
         kfunc_flush_tlb_page(vma, uaddr);
+        printk(KERN_EMERG "wxshadow: [tlb] flush_tlb_page returned\n");
     } else if (kfunc___flush_tlb_range) {
-        /* __flush_tlb_range(vma, start, end, stride, last_level, tlb_level)
-         * last_level=true: only invalidate last-level PTE
-         * tlb_level=3: PTE level for 4K pages
-         */
+        printk(KERN_EMERG "wxshadow: [tlb] using __flush_tlb_range(%px, %lx)\n", vma, uaddr);
         kfunc___flush_tlb_range(vma, uaddr, uaddr + PAGE_SIZE, PAGE_SIZE, true, 3);
+        printk(KERN_EMERG "wxshadow: [tlb] __flush_tlb_range returned\n");
     } else {
-        /* Final fallback: use TLBI instruction directly */
         void *mm = vma ? vma_mm(vma) : NULL;
+        printk(KERN_EMERG "wxshadow: [tlb] using TLBI instruction (mm=%px)\n", mm);
         wxshadow_tlbi_page(mm, uaddr);
+        printk(KERN_EMERG "wxshadow: [tlb] TLBI done\n");
     }
 }
 
@@ -536,24 +537,39 @@ static int wxshadow_page_switch_mapping_locked(struct wxshadow_page *page,
     void *mm = vma_mm(vma);
     u64 *pte;
     u64 entry;
+    u64 old_pte;
+    int ret;
 
     if (!page)
         return -1;
 
+    printk(KERN_EMERG "wxshadow: [switch] START addr=%lx pfn=%lx prot=%llx\n",
+           addr, target_pfn, prot);
+
     if (!mm) {
-        pr_err("wxshadow: [switch] vma_mm returned NULL\n");
+        printk(KERN_EMERG "wxshadow: [switch] vma_mm returned NULL\n");
         return -1;
     }
+    printk(KERN_EMERG "wxshadow: [switch] mm=%px vma=%px\n", mm, vma);
 
     pte = get_user_pte(mm, addr, NULL);
     if (!pte) {
-        pr_err("wxshadow: [switch] get_user_pte failed for addr=%lx\n", addr);
+        printk(KERN_EMERG "wxshadow: [switch] get_user_pte FAILED addr=%lx\n", addr);
         return -1;
     }
+    old_pte = *(volatile u64 *)pte;
+    printk(KERN_EMERG "wxshadow: [switch] pte=%px old_val=%llx\n", pte, old_pte);
 
     entry = make_pte(target_pfn, prot);
-    return wxshadow_page_write_pte_locked(page, mm, vma, addr, pte, entry,
-                                          true);
+    printk(KERN_EMERG "wxshadow: [switch] new_entry=%llx (about to write)\n", entry);
+
+    wxshadow_set_pte_at_raw(mm, addr, pte, entry);
+    printk(KERN_EMERG "wxshadow: [switch] PTE written OK, flushing TLB...\n");
+
+    wxshadow_flush_tlb_page(vma, addr);
+    printk(KERN_EMERG "wxshadow: [switch] TLB flush DONE\n");
+
+    return 0;
 }
 
 int wxshadow_page_activate_shadow_locked(struct wxshadow_page *page, void *vma,

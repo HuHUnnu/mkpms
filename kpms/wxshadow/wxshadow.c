@@ -1344,104 +1344,135 @@ static void wx_unregister_brk_step_hooks(void)
 
 /* ========== Module init/exit ========== */
 
+/*
+ * Debug args (combine freely):
+ *   "nopf"   → skip do_page_fault hook
+ *   "nogup"  → skip follow_page_pte hook
+ *   "nofork" → skip dup_mmap/uprobe_dup_mmap hooks
+ *   "noexit" → skip exit_mmap hook
+ *   "safe"   → nopf + nogup + nofork
+ *   "noall"  → skip ALL hooks (only symbol resolution + struct scanning)
+ */
+static int skip_page_fault_hook = 0;
+static int skip_follow_pte_hook = 0;
+static int skip_fork_hook = 0;
+static int skip_exit_mmap_hook = 0;
+static int skip_all_hooks = 0;
+
 static long wxshadow_init(const char *args, const char *event, void *__user reserved)
 {
     int ret;
 
-    pr_info("wxshadow: initializing...\n");
+    printk(KERN_EMERG "wxshadow: >>> INIT BEGIN args='%s'\n", args ? args : "");
 
-    /* Resolve kernel symbols */
-    ret = resolve_symbols();
-    if (ret < 0) {
-        pr_err("wxshadow: failed to resolve symbols\n");
-        return ret;
-    }
-
-    /* Scan mm_struct offsets */
-    ret = scan_mm_struct_offsets();
-    if (ret < 0) {
-        pr_err("wxshadow: failed to scan mm_struct offsets\n");
-        return ret;
-    }
-
-    /* Scan vm_area_struct offsets */
-    ret = scan_vma_struct_offsets();
-    if (ret < 0) {
-        pr_err("wxshadow: failed to scan vma offsets\n");
-        return ret;
-    }
-
-    /* Detect task_struct offsets */
-    ret = detect_task_struct_offsets();
-    if (ret < 0) {
-        pr_err("wxshadow: failed to detect task_struct offsets\n");
-        return ret;
-    }
-
-    /* Only scan mm->context.id if we need TLBI instruction fallback */
-    if (!kfunc_flush_tlb_page && !kfunc___flush_tlb_range) {
-        pr_info("wxshadow: no kernel TLB flush function, need mm->context.id for TLBI\n");
-        ret = try_scan_mm_context_id_offset();
-        if (ret < 0) {
-            /* Scan may fail if in kernel thread context (ASID=0 in TTBR0).
-             * Will retry lazily at first prctl call when in user process context. */
-            pr_info("wxshadow: context.id scan deferred (will retry at first prctl)\n");
+    /* Parse debug arguments */
+    if (args) {
+        if (strstr(args, "noall")) {
+            skip_all_hooks = 1;
+            skip_page_fault_hook = 1;
+            skip_follow_pte_hook = 1;
+            skip_fork_hook = 1;
+            skip_exit_mmap_hook = 1;
         }
+        if (strstr(args, "safe")) {
+            skip_page_fault_hook = 1;
+            skip_follow_pte_hook = 1;
+            skip_fork_hook = 1;
+        }
+        if (strstr(args, "nopf"))    skip_page_fault_hook = 1;
+        if (strstr(args, "nogup"))   skip_follow_pte_hook = 1;
+        if (strstr(args, "nofork"))  skip_fork_hook = 1;
+        if (strstr(args, "noexit"))  skip_exit_mmap_hook = 1;
     }
 
-    /* page_list already initialized by LIST_HEAD() macro */
+    /* ---- STEP 1: Symbol resolution ---- */
+    printk(KERN_EMERG "wxshadow: >>> STEP 1/12: resolve_symbols\n");
+    ret = resolve_symbols();
+    printk(KERN_EMERG "wxshadow: <<< STEP 1/12: resolve_symbols ret=%d\n", ret);
+    if (ret < 0)
+        return ret;
 
-    /* Register BRK/step handlers */
-    /* NOTE: Temporarily prefer REGISTER method for testing */
+    /* ---- STEP 2: mm_struct offset scan ---- */
+    printk(KERN_EMERG "wxshadow: >>> STEP 2/12: scan_mm_struct\n");
+    ret = scan_mm_struct_offsets();
+    printk(KERN_EMERG "wxshadow: <<< STEP 2/12: scan_mm_struct ret=%d\n", ret);
+    if (ret < 0)
+        return ret;
+
+    /* ---- STEP 3: VMA offset scan ---- */
+    printk(KERN_EMERG "wxshadow: >>> STEP 3/12: scan_vma\n");
+    ret = scan_vma_struct_offsets();
+    printk(KERN_EMERG "wxshadow: <<< STEP 3/12: scan_vma ret=%d\n", ret);
+    if (ret < 0)
+        return ret;
+
+    /* ---- STEP 4: task_struct offset detection ---- */
+    printk(KERN_EMERG "wxshadow: >>> STEP 4/12: detect_task_struct\n");
+    ret = detect_task_struct_offsets();
+    printk(KERN_EMERG "wxshadow: <<< STEP 4/12: detect_task_struct ret=%d\n", ret);
+    if (ret < 0)
+        return ret;
+
+    /* ---- STEP 5: mm->context.id scan (optional) ---- */
+    if (!kfunc_flush_tlb_page && !kfunc___flush_tlb_range) {
+        printk(KERN_EMERG "wxshadow: >>> STEP 5/12: context_id_scan\n");
+        ret = try_scan_mm_context_id_offset();
+        printk(KERN_EMERG "wxshadow: <<< STEP 5/12: context_id_scan ret=%d\n", ret);
+    } else {
+        printk(KERN_EMERG "wxshadow: --- STEP 5/12 SKIP: TLB flush OK\n");
+    }
+
+    if (skip_all_hooks) {
+        printk(KERN_EMERG "wxshadow: === ALL HOOKS SKIPPED — returning 0 ===\n");
+        return 0;
+    }
+
+    printk(KERN_EMERG "wxshadow: >>> STEP 6/12: BRK/step hooks\n");
     if (kfunc_register_user_break_hook && kfunc_register_user_step_hook) {
-        /* Method 1: register_user_*_hook API (testing priority) */
-        pr_info("wxshadow: using register_user_*_hook API (testing priority)\n");
-
-        /* Initialize list_head nodes */
+        pr_info("wxshadow: using register_user_*_hook API\n");
         INIT_LIST_HEAD(&wxshadow_break_hook.node);
         INIT_LIST_HEAD(&wxshadow_step_hook.node);
 
-        pr_info("wxshadow: registering break hook (imm=0x%x)...\n", wxshadow_break_hook.imm);
+        pr_info("wxshadow:   6a: registering break hook (imm=0x%x)...\n", wxshadow_break_hook.imm);
         kfunc_register_user_break_hook(&wxshadow_break_hook);
-        pr_info("wxshadow: registered break hook\n");
+        pr_info("wxshadow:   6a: break hook registered OK\n");
 
-        pr_info("wxshadow: registering step hook...\n");
+        pr_info("wxshadow:   6b: registering step hook...\n");
         kfunc_register_user_step_hook(&wxshadow_step_hook);
-        pr_info("wxshadow: registered step hook\n");
+        pr_info("wxshadow:   6b: step hook registered OK\n");
 
         hook_method = WX_HOOK_METHOD_REGISTER;
     } else if (kfunc_brk_handler && kfunc_single_step_handler) {
-        /* Method 2: Direct hook (fallback) */
         pr_info("wxshadow: using direct hook method (fallback)\n");
 
-        pr_info("wxshadow: hooking brk_handler at %px...\n", kfunc_brk_handler);
+        pr_info("wxshadow:   6a: hook_wrap3 brk_handler at %px...\n", kfunc_brk_handler);
         ret = hook_wrap3(kfunc_brk_handler, brk_handler_before, NULL, NULL);
         if (ret != HOOK_NO_ERR) {
             pr_err("wxshadow: failed to hook brk_handler: %d\n", ret);
             return -1;
         }
-        pr_info("wxshadow: hooked brk_handler\n");
+        pr_info("wxshadow:   6a: brk_handler hooked OK\n");
 
-        pr_info("wxshadow: hooking single_step_handler at %px...\n", kfunc_single_step_handler);
+        pr_info("wxshadow:   6b: hook_wrap3 single_step_handler at %px...\n", kfunc_single_step_handler);
         ret = hook_wrap3(kfunc_single_step_handler, single_step_handler_before, NULL, NULL);
         if (ret != HOOK_NO_ERR) {
             pr_err("wxshadow: failed to hook single_step_handler: %d\n", ret);
             hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
             return -1;
         }
-        pr_info("wxshadow: hooked single_step_handler\n");
+        pr_info("wxshadow:   6b: single_step_handler hooked OK\n");
 
         hook_method = WX_HOOK_METHOD_DIRECT;
     } else {
         pr_err("wxshadow: no hook method available\n");
         return -1;
     }
+    printk(KERN_EMERG "wxshadow: <<< STEP 6/12: BRK/step method=%d\n", hook_method);
 
-    /* Hook prctl syscall */
+    printk(KERN_EMERG "wxshadow: >>> STEP 7/12: prctl\n");
     ret = hook_syscalln(__NR_prctl, 5, prctl_before, NULL, NULL);
     if (ret != HOOK_NO_ERR) {
         pr_err("wxshadow: failed to hook prctl: %d\n", ret);
-        /* Cleanup based on hook method */
         if (hook_method == WX_HOOK_METHOD_DIRECT) {
             hook_unwrap(kfunc_single_step_handler, single_step_handler_before, NULL);
             hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
@@ -1451,54 +1482,74 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
         hook_method = WX_HOOK_METHOD_NONE;
         return -1;
     }
-    pr_info("wxshadow: hooked prctl syscall\n");
+    printk(KERN_EMERG "wxshadow: <<< STEP 7/12: prctl OK\n");
 
-    /* Hook do_page_fault for read/exec fault handling */
-    if (kfunc_do_page_fault) {
+    printk(KERN_EMERG "wxshadow: >>> STEP 8/12: do_page_fault %px\n", kfunc_do_page_fault);
+    if (skip_page_fault_hook) {
+        pr_info("wxshadow: do_page_fault SKIPPED by args\n");
+        kfunc_do_page_fault = NULL;
+    } else if (kfunc_do_page_fault) {
         ret = hook_wrap3(kfunc_do_page_fault, do_page_fault_before, NULL, NULL);
         if (ret != HOOK_NO_ERR) {
-            pr_warn("wxshadow: failed to hook do_page_fault: %d\n", ret);
-            pr_warn("wxshadow: read hiding will be disabled\n");
+            pr_warn("wxshadow: failed to hook do_page_fault: %d (read hiding disabled)\n", ret);
             kfunc_do_page_fault = NULL;
         } else {
-            pr_info("wxshadow: hooked do_page_fault for read/exec fault handling\n");
+            pr_info("wxshadow: do_page_fault hooked OK\n");
         }
-    }
-
-    /* Hook exit_mmap - required for safe teardown on process exit */
-    ret = hook_wrap1(kfunc_exit_mmap, exit_mmap_before, NULL, NULL);
-    if (ret != HOOK_NO_ERR) {
-        pr_err("wxshadow: failed to hook exit_mmap: %d\n", ret);
-        pr_err("wxshadow: refusing to load without exit_mmap cleanup\n");
-        if (kfunc_do_page_fault)
-            hook_unwrap(kfunc_do_page_fault, do_page_fault_before, NULL);
-        unhook_syscalln(__NR_prctl, prctl_before, NULL);
-        if (hook_method == WX_HOOK_METHOD_DIRECT) {
-            hook_unwrap(kfunc_single_step_handler, single_step_handler_before, NULL);
-            hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
-        } else if (hook_method == WX_HOOK_METHOD_REGISTER) {
-            wx_unregister_brk_step_hooks();
-        }
-        hook_method = WX_HOOK_METHOD_NONE;
-        return -1;
     } else {
-        pr_info("wxshadow: hooked exit_mmap for proper cleanup\n");
+        pr_info("wxshadow: do_page_fault not found, skipped\n");
     }
+    printk(KERN_EMERG "wxshadow: <<< STEP 8/12\n");
 
-    /* Hook follow_page_pte for GUP hiding (/proc/pid/mem, process_vm_readv, ptrace) */
-    if (kfunc_follow_page_pte) {
+    printk(KERN_EMERG "wxshadow: >>> STEP 9/12: exit_mmap %px\n", kfunc_exit_mmap);
+    if (skip_exit_mmap_hook) {
+        pr_info("wxshadow: exit_mmap SKIPPED by args\n");
+        kfunc_exit_mmap = NULL;
+    } else {
+        ret = hook_wrap1(kfunc_exit_mmap, exit_mmap_before, NULL, NULL);
+        if (ret != HOOK_NO_ERR) {
+            pr_err("wxshadow: failed to hook exit_mmap: %d — refusing to load\n", ret);
+            if (kfunc_do_page_fault)
+                hook_unwrap(kfunc_do_page_fault, do_page_fault_before, NULL);
+            unhook_syscalln(__NR_prctl, prctl_before, NULL);
+            if (hook_method == WX_HOOK_METHOD_DIRECT) {
+                hook_unwrap(kfunc_single_step_handler, single_step_handler_before, NULL);
+                hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
+            } else if (hook_method == WX_HOOK_METHOD_REGISTER) {
+                wx_unregister_brk_step_hooks();
+            }
+            hook_method = WX_HOOK_METHOD_NONE;
+            return -1;
+        }
+        pr_info("wxshadow: exit_mmap hooked OK\n");
+    }
+    printk(KERN_EMERG "wxshadow: <<< STEP 9/12\n");
+
+    printk(KERN_EMERG "wxshadow: >>> STEP 10/12: follow_page_pte %px\n", kfunc_follow_page_pte);
+    if (skip_follow_pte_hook) {
+        pr_info("wxshadow: follow_page_pte SKIPPED by args\n");
+        kfunc_follow_page_pte = NULL;
+    } else if (kfunc_follow_page_pte) {
         ret = hook_wrap5(kfunc_follow_page_pte,
                          follow_page_pte_before, follow_page_pte_after, NULL);
         if (ret != HOOK_NO_ERR) {
             pr_warn("wxshadow: failed to hook follow_page_pte: %d\n", ret);
             kfunc_follow_page_pte = NULL;
         } else {
-            pr_info("wxshadow: hooked follow_page_pte for GUP hiding\n");
+            pr_info("wxshadow: follow_page_pte hooked OK\n");
         }
+    } else {
+        pr_info("wxshadow: follow_page_pte not found, skipped\n");
     }
+    printk(KERN_EMERG "wxshadow: <<< STEP 10/12\n");
 
-    /* Hook fork protection only on precise mm-duplication callbacks. */
-    if (kfunc_dup_mmap) {
+    printk(KERN_EMERG "wxshadow: >>> STEP 11/12: fork\n");
+    if (skip_fork_hook) {
+        pr_info("wxshadow: fork hooks SKIPPED by args\n");
+        kfunc_dup_mmap = NULL;
+        kfunc_uprobe_dup_mmap = NULL;
+    } else if (kfunc_dup_mmap) {
+        pr_info("wxshadow:   11a: hook_wrap2 dup_mmap at %px...\n", kfunc_dup_mmap);
         ret = hook_wrap2(kfunc_dup_mmap,
                          before_dup_mmap_wx,
                          after_dup_mmap_wx, NULL);
@@ -1506,11 +1557,11 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
             pr_warn("wxshadow: failed to hook dup_mmap: %d\n", ret);
             kfunc_dup_mmap = NULL;
         } else {
-            pr_info("wxshadow: hooked dup_mmap at %px for fork protection\n",
-                    kfunc_dup_mmap);
+            pr_info("wxshadow:   11a: dup_mmap hooked OK\n");
         }
     }
     if (!kfunc_dup_mmap && kfunc_uprobe_dup_mmap) {
+        pr_info("wxshadow:   11b: hook_wrap2 uprobe_dup_mmap at %px...\n", kfunc_uprobe_dup_mmap);
         ret = hook_wrap2(kfunc_uprobe_dup_mmap,
                          before_uprobe_dup_mmap_wx,
                          after_uprobe_dup_mmap_wx, NULL);
@@ -1518,34 +1569,14 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
             pr_warn("wxshadow: failed to hook uprobe_dup_mmap: %d\n", ret);
             kfunc_uprobe_dup_mmap = NULL;
         } else {
-            pr_info("wxshadow: hooked uprobe_dup_mmap at %px for fork protection\n",
-                    kfunc_uprobe_dup_mmap);
+            pr_info("wxshadow:   11b: uprobe_dup_mmap hooked OK\n");
         }
     }
-    if (!kfunc_dup_mmap && !kfunc_uprobe_dup_mmap) {
-        pr_warn("wxshadow: fork protection DISABLED (precise dup_mmap hooks unavailable; copy_process fallback intentionally disabled because it is too broad)\n");
-    }
+    if (!kfunc_dup_mmap && !kfunc_uprobe_dup_mmap)
+        pr_warn("wxshadow: fork protection DISABLED\n");
+    printk(KERN_EMERG "wxshadow: <<< STEP 11/12\n");
 
-    pr_info("wxshadow: W^X shadow memory module loaded\n");
-    pr_info("wxshadow: use prctl(0x%x, pid, addr) to set breakpoint\n", PR_WXSHADOW_SET_BP);
-    pr_info("wxshadow: use prctl(0x%x, pid, addr, reg, val) to set reg mod\n", PR_WXSHADOW_SET_REG);
-    pr_info("wxshadow: use prctl(0x%x, pid, addr) to delete breakpoint\n", PR_WXSHADOW_DEL_BP);
-    pr_info("wxshadow: use prctl(0x%x, pid, addr, buf, len) to patch shadow\n", PR_WXSHADOW_PATCH);
-    pr_info("wxshadow: use prctl(0x%x, pid, addr) to release shadow\n", PR_WXSHADOW_RELEASE);
-    if (kfunc_do_page_fault) {
-        pr_info("wxshadow: read hiding ENABLED (do_page_fault hooked)\n");
-    } else {
-        pr_info("wxshadow: read hiding DISABLED\n");
-    }
-    if (kfunc_follow_page_pte) {
-        pr_info("wxshadow: GUP hiding ENABLED (follow_page_pte hooked)\n");
-    } else {
-        pr_info("wxshadow: GUP hiding DISABLED\n");
-    }
-
-    /* Debug: print first 10 processes */
-    debug_print_tasks_list(10);
-
+    printk(KERN_EMERG "wxshadow: === MODULE LOADED SUCCESSFULLY ===\n");
     return 0;
 }
 
