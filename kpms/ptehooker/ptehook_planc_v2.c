@@ -2399,6 +2399,9 @@ static void fork_prop_isolate(struct task_struct *child, int slot)
                                       FOLL_WRITE | FOLL_FORCE);
             if (w == 4096)
                 total++;
+            else
+                pr_info("prop_isolate: FAIL ctx[%d] pg[%d] va=0x%lx w=%d\n",
+                        ci, pi, va, w);
         }
 
         /* Clear VM_WRITE but keep private — pages are read-only data */
@@ -2407,8 +2410,8 @@ static void fork_prop_isolate(struct task_struct *child, int slot)
 
     fn_mmput(mm);
     g_prop.installs++;
-    pr_info("prop_isolate: pid=%d slot=%d pages=%d (cow)\n",
-            child_pid, slot, total);
+    pr_info("prop_isolate: pid=%d slot=%d pages=%d/%d (cow)\n",
+            child_pid, slot, total, g_prop.total_pages);
 }
 
 /*
