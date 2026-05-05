@@ -41,6 +41,7 @@
 
 #include "dbi_kern.h"
 #include "ghost_mm.h"
+#include "fork_handler.h"
 
 KPM_NAME("ptehook-planc-v2");
 KPM_VERSION("2.0.0");
@@ -298,6 +299,14 @@ struct plan_c_v2 {
 
 static struct plan_c_v2 g_h;
 
+/* ---------- Fork Handler State ---------- */
+static struct fork_handler_state g_fork;
+static struct prop_isolation_state g_prop;
+
+/* wake_up_new_task / kernel_clone function pointer (resolved at init) */
+static void *addr_wake_up_new_task;
+static void *addr_do_exit;
+
 /* ---------- String parsing ---------- */
 
 static unsigned long parse_num(const char **sp)
@@ -548,9 +557,10 @@ static void before_do_mem_abort(hook_fargs3_t *fargs, void *udata)
 /* ---------- PTE read/set_uxn callback ---------- */
 
 struct pte_op {
-    int mode;                /* 0=read, 1=set_uxn, 2=restore */
+    int mode;                /* 0=read, 1=set_uxn, 2=restore, 3=write_full */
     uint64_t *out_val;
     uint64_t orig_val;
+    uint64_t new_val;        /* used by mode 3: full PTE write */
 };
 
 static int pte_op_cb(void *pte, unsigned long addr, void *data)
@@ -561,6 +571,7 @@ static int pte_op_cb(void *pte, unsigned long addr, void *data)
     if (ctx->out_val) *ctx->out_val = val;
     if (ctx->mode == 1)      *p = val | (1UL << 54);
     else if (ctx->mode == 2) *p = ctx->orig_val;
+    else if (ctx->mode == 3) *p = ctx->new_val;
     return 0;
 }
 
@@ -1826,8 +1837,11 @@ static int cmd_proc_patch(int pid, unsigned long addr, const char *hex,
 {
     int off = 0;
     struct task_struct *task;
+    struct mm_struct *mm;
+    void *vma;
     static uint8_t tmpbuf[4096];
     int n, r;
+    unsigned long *flags_ptr, orig_flags, vma_start;
 
     off += snprintf(buf + off, bsize - off,
                      "=== PROC-PATCH ===\n"
@@ -1840,12 +1854,59 @@ static int cmd_proc_patch(int pid, unsigned long addr, const char *hex,
     if (n <= 0)
         return off + snprintf(buf + off, bsize - off, "[FAIL] bad hex\n");
 
+    /*
+     * Kernel 6.1+ hardening: access_process_vm with FOLL_WRITE|FOLL_FORCE
+     * rejects writes to file-backed r-x VMAs (VM_MAYWRITE not set).
+     * Workaround: temporarily add VM_WRITE|VM_MAYWRITE to the VMA flags
+     * so the kernel performs proper CoW (per-process private page copy).
+     */
+    mm = fn_get_task_mm(task);
+    if (!mm) return off + snprintf(buf + off, bsize - off, "[FAIL] mm\n");
+
+    vma = fn_find_vma(mm, addr);
+    if (!vma) {
+        fn_mmput(mm);
+        return off + snprintf(buf + off, bsize - off, "[FAIL] find_vma\n");
+    }
+
+    vma_start = *(unsigned long *)((char *)vma + OFF_VMA_START);
+    if (addr < vma_start) {
+        fn_mmput(mm);
+        return off + snprintf(buf + off, bsize - off,
+                               "[FAIL] addr 0x%lx < vma_start 0x%lx\n",
+                               addr, vma_start);
+    }
+
+    /* vm_flags at offset 0x20 (ARM64 6.x: after vm_start, vm_end, vm_mm, vm_page_prot) */
+#define OFF_VMA_FLAGS 0x20
+#define KVM_WRITE      0x00000002UL
+#define KVM_MAYWRITE   0x00000020UL
+
+    flags_ptr = (unsigned long *)((char *)vma + OFF_VMA_FLAGS);
+    orig_flags = *flags_ptr;
+
+    /* Sanity: expect VM_READ(0x1)|VM_EXEC(0x4) set, VM_WRITE(0x2) clear */
+    if (!(orig_flags & 0x1) || !(orig_flags & 0x4)) {
+        off += snprintf(buf + off, bsize - off,
+                         "[WARN] unexpected vma_flags=0x%lx (not r-x?)\n",
+                         orig_flags);
+    }
+
+    /* Add write permission temporarily */
+    *flags_ptr = orig_flags | KVM_WRITE | KVM_MAYWRITE;
+
     r = fn_access_process_vm(task, addr, tmpbuf, n, FOLL_WRITE | FOLL_FORCE);
+
+    /* Restore immediately — process is SIGSTOP'd so no race */
+    *flags_ptr = orig_flags;
+    fn_mmput(mm);
+
     if (r != n)
         return off + snprintf(buf + off, bsize - off,
-                               "[FAIL] write: got %d, want %d\n", r, n);
+                               "[FAIL] write: got %d, want %d (flags were 0x%lx)\n",
+                               r, n, orig_flags);
 
-    /* Flush I-cache globally (inner shareable) so CPU fetches fresh bytes */
+    /* Flush I-cache globally so CPU fetches the patched instructions */
     asm volatile(
         "dsb ishst\n\t"
         "ic ialluis\n\t"
@@ -1855,7 +1916,8 @@ static int cmd_proc_patch(int pid, unsigned long addr, const char *hex,
     );
 
     return off + snprintf(buf + off, bsize - off,
-                           "[OK] wrote %d bytes\n", n);
+                           "[OK] wrote %d bytes (CoW triggered, flags=0x%lx)\n",
+                           n, orig_flags);
 }
 
 /* proc-read <pid> <addr> <len> — read N bytes from target into output (hex) */
@@ -2039,6 +2101,1139 @@ static int cmd_spawn_signal(int pid, int sig, char *buf, int buflen)
     return off;
 }
 
+/* ========== FORK HANDLER IMPLEMENTATION ========== */
+
+/*
+ * Check if a PID is in the watched list (Zygote/Zygote64).
+ */
+static int fork_is_watched_parent(int pid)
+{
+    int i;
+    if (!g_fork.active) return 0;
+    for (i = 0; i < g_fork.num_watched; i++)
+        if (g_fork.watched_pids[i] == pid) return 1;
+    return 0;
+}
+
+/*
+ * Find a free child slot.
+ */
+static int fork_find_free_child_slot(void)
+{
+    int i;
+    for (i = 0; i < FORK_MAX_SLOTS; i++)
+        if (!g_fork.children[i].active) return i;
+    return -1;
+}
+
+/*
+ * Find child slot by PID (for cleanup on exit).
+ */
+static int fork_find_child_by_pid(int pid)
+{
+    int i;
+    for (i = 0; i < FORK_MAX_SLOTS; i++)
+        if (g_fork.children[i].active && g_fork.children[i].child_pid == pid)
+            return i;
+    return -1;
+}
+
+/*
+ * Build an RWX PTE from template + physical address.
+ * Clears UXN/PXN/GP/AP[2] to make the page executable + writable + no BTI.
+ */
+static uint64_t fork_build_pte(unsigned long pa)
+{
+    uint64_t pte = (g_fork.pte_template & ~0x0000FFFFFFFFF000ULL)
+                 | (pa & 0x0000FFFFFFFFF000ULL);
+    pte |= (1UL << 0) | (1UL << 1) | (1UL << 10);
+    pte &= ~(1UL << 54);
+    pte &= ~(1UL << 53);
+    pte &= ~(1UL << 50);
+    pte &= ~(1UL << 7);
+    return pte;
+}
+
+/*
+ * Install a single PTE in a child's mm at ghost_va, then TLB flush.
+ */
+static int fork_install_pte(struct mm_struct *mm, unsigned long pa)
+{
+    struct pte_op pop;
+    int r;
+    pop.mode = 3;
+    pop.out_val = 0;
+    pop.new_val = fork_build_pte(pa);
+    r = fn_apply_to_page_range(mm, g_fork.ghost_va, 0x1000, pte_op_cb, &pop);
+    if (r) return r;
+    asm volatile("tlbi vmalle1is" ::: "memory");
+    asm volatile("dsb ish" ::: "memory");
+    asm volatile("isb" ::: "memory");
+    return 0;
+}
+
+/*
+ * Install ghost page in a child process's page table.
+ * identity_idx >= 0: allocate private page, stamp identity (full interception)
+ * identity_idx == -1: map shared passthrough page (no allocation)
+ */
+static int fork_inject_ghost(struct task_struct *child, int identity_idx)
+{
+    struct mm_struct *mm;
+    unsigned long kpage, pa;
+    int child_slot, order, num_pages, r;
+
+    mm = fn_get_task_mm(child);
+    if (!mm) return -1;
+
+    /* Passthrough: map the pre-allocated shared page (no per-child alloc) */
+    if (identity_idx < 0) {
+        if (!g_fork.passthrough_pa) {
+            fn_mmput(mm);
+            return -10;
+        }
+        r = fork_install_pte(mm, g_fork.passthrough_pa);
+        fn_mmput(mm);
+        return r;
+    }
+
+    /* Full interception: allocate a private page for this child */
+    order = g_fork.ghost_order;
+    num_pages = 1 << order;
+
+    kpage = fn_get_free_pages(GFP_KERNEL_FLAG, order);
+    if (!kpage) {
+        pr_err("fork_handler: __get_free_pages failed order=%d\n", order);
+        fn_mmput(mm);
+        return -2;
+    }
+
+    memcpy((void *)kpage, g_fork.code_template, g_fork.code_len);
+
+    if (identity_idx < FORK_MAX_SLOTS &&
+        g_fork.identity_offset > 0 && g_fork.slot_data_len[identity_idx] > 0) {
+        uint8_t *dst = (uint8_t *)kpage + g_fork.identity_offset;
+        int slen = g_fork.slot_data_len[identity_idx];
+        if (g_fork.identity_offset + slen <= (int)(num_pages << 12))
+            memcpy(dst, g_fork.slot_data[identity_idx], slen);
+    }
+
+    pa = kva_to_pa_at(kpage);
+    if (!pa) {
+        pr_err("fork_handler: kva_to_pa_at failed kpage=0x%lx\n", kpage);
+        fn_free_pages(kpage, order);
+        fn_mmput(mm);
+        return -3;
+    }
+
+    r = fork_install_pte(mm, pa);
+
+    if (!r && num_pages > 1) {
+        int pg;
+        for (pg = 1; pg < num_pages && !r; pg++) {
+            unsigned long next_pa = pa + (pg << 12);
+            struct pte_op pop2;
+            pop2.mode = 3;
+            pop2.out_val = 0;
+            pop2.new_val = fork_build_pte(next_pa);
+            r = fn_apply_to_page_range(mm, g_fork.ghost_va + (pg << 12),
+                                        0x1000, pte_op_cb, &pop2);
+        }
+        asm volatile("tlbi vmalle1is" ::: "memory");
+        asm volatile("dsb ish" ::: "memory");
+        asm volatile("isb" ::: "memory");
+    }
+
+    if (r) {
+        pr_err("fork_handler: PTE install failed r=%d ghost_va=0x%lx\n",
+                r, g_fork.ghost_va);
+        fn_mmput(mm);
+        fn_free_pages(kpage, order);
+        return -4;
+    }
+
+    /* I-cache coherency */
+    {
+        unsigned long addr;
+        for (addr = kpage; addr < kpage + (num_pages << 12); addr += 64)
+            asm volatile("dc cvau, %0" :: "r"(addr));
+        asm volatile("dsb ish" ::: "memory");
+        asm volatile("ic ialluis" ::: "memory");
+        asm volatile("dsb ish" ::: "memory");
+        asm volatile("isb" ::: "memory");
+    }
+
+    fn_mmput(mm);
+
+    child_slot = fork_find_free_child_slot();
+    if (child_slot >= 0) {
+        int child_pid = 0;
+        if (fn_task_pid_nr_ns)
+            child_pid = fn_task_pid_nr_ns(child, 0, 0);
+        g_fork.children[child_slot].active = 1;
+        g_fork.children[child_slot].child_pid = child_pid;
+        g_fork.children[child_slot].phys_page = kpage;
+        g_fork.children[child_slot].ghost_kaddr = kpage;
+        g_fork.children[child_slot].identity_idx = identity_idx;
+        g_fork.num_active_children++;
+    }
+
+    return 0;
+}
+
+static int safe_strnlen(const char *s, int maxlen)
+{
+    int i;
+    for (i = 0; i < maxlen && s[i]; i++) ;
+    return i;
+}
+
+/*
+ * ART heap Build.* patching for a child process.
+ * Uses access_process_vm to write new String data (triggers CoW).
+ * Writes only strlen(replacement) bytes to avoid overflowing shorter
+ * original String objects and corrupting adjacent ART heap data.
+ */
+static void art_write_string(struct task_struct *child,
+                              unsigned long obj_addr, int hdr,
+                              const char *str, int maxlen)
+{
+    int len = safe_strnlen(str, maxlen);
+    /* count (4B) + hash_code (4B), written as single 8-byte atomic write
+     * to avoid partial CoW issues during wake_up_new_task. */
+    uint32_t count_hash[2];
+
+    fn_access_process_vm(child, obj_addr + hdr,
+                          (void *)str, len,
+                          FOLL_WRITE | FOLL_FORCE);
+
+    /* ART String layout at obj+hdr-8: [count_][hash_code_]
+     * count = length << 1 (compressed Latin-1), hash_code = 0 (force recompute) */
+    count_hash[0] = (uint32_t)(len << 1);
+    count_hash[1] = 0;
+    fn_access_process_vm(child, obj_addr + hdr - 8,
+                          count_hash, sizeof(count_hash),
+                          FOLL_WRITE | FOLL_FORCE);
+}
+
+static void fork_patch_art_heap(struct task_struct *child, int identity_idx)
+{
+    struct sandbox_identity *id = &g_fork.identities[identity_idx];
+    int hdr = g_fork.art_heap.string_header_size;
+
+    if (!g_fork.art_heap.configured || !id->configured) return;
+
+    if (g_fork.art_heap.model_addr && id->model[0])
+        art_write_string(child, g_fork.art_heap.model_addr, hdr,
+                          id->model, FORK_IDENTITY_MODEL_LEN);
+
+    if (g_fork.art_heap.brand_addr && id->brand[0])
+        art_write_string(child, g_fork.art_heap.brand_addr, hdr,
+                          id->brand, FORK_IDENTITY_BRAND_LEN);
+
+    if (g_fork.art_heap.fingerprint_addr && id->fingerprint[0])
+        art_write_string(child, g_fork.art_heap.fingerprint_addr, hdr,
+                          id->fingerprint, 128);
+}
+
+/* ---------- Property CoW Isolation ---------- */
+
+#define KVM_SHARED     0x00000008UL
+#define KVM_MAYSHARE   0x00000080UL
+
+/*
+ * Isolate property pages via CoW — convert VMA from MAP_SHARED to MAP_PRIVATE
+ * temporarily, then write template data. The kernel's CoW mechanism allocates
+ * proper per-process pages with correct refcount/rmap/LRU state.
+ *
+ * Must run before child is scheduled (before_wake_up_new_task).
+ */
+static void fork_prop_isolate(struct task_struct *child, int slot)
+{
+    struct mm_struct *mm;
+    int ci, pi, child_pid, total = 0;
+
+    if (!g_prop.ready || g_prop.total_pages == 0) return;
+    if (slot < 0 || slot >= FORK_MAX_SLOTS) return;
+
+    child_pid = 0;
+    if (fn_task_pid_nr_ns)
+        child_pid = fn_task_pid_nr_ns(child, 0, 0);
+
+    mm = fn_get_task_mm(child);
+    if (!mm) return;
+
+    for (ci = 0; ci < g_prop.ctx_count; ci++) {
+        struct prop_ctx_info *ctx = &g_prop.contexts[ci];
+        struct vm_area_struct *vma;
+        unsigned long *flags_ptr, orig_flags;
+
+        vma = fn_find_vma(mm, ctx->va_start);
+        if (!vma) continue;
+
+        {
+            unsigned long vs = *(unsigned long *)((char *)vma + OFF_VMA_START);
+            if (ctx->va_start < vs) continue;
+        }
+
+        flags_ptr = (unsigned long *)((char *)vma + OFF_VMA_FLAGS);
+        orig_flags = *flags_ptr;
+
+        /* Clear VM_SHARED → forces CoW path instead of shared-page write */
+        *flags_ptr = (orig_flags & ~(KVM_SHARED | KVM_MAYSHARE))
+                   | KVM_WRITE | KVM_MAYWRITE;
+
+        for (pi = 0; pi < ctx->num_pages; pi++) {
+            int tmpl_idx = ctx->template_base + pi;
+            unsigned long src = g_prop.templates[slot][tmpl_idx];
+            unsigned long va;
+            int w;
+
+            if (!src) continue;
+
+            va = ctx->va_start + (unsigned long)ctx->page_indices[pi] * 4096;
+            w = fn_access_process_vm(child, va, (void *)src, 4096,
+                                      FOLL_WRITE | FOLL_FORCE);
+            if (w == 4096)
+                total++;
+        }
+
+        *flags_ptr = orig_flags;
+    }
+
+    fn_mmput(mm);
+    g_prop.installs++;
+    pr_info("prop_isolate: pid=%d slot=%d pages=%d (cow)\n",
+            child_pid, slot, total);
+}
+
+/*
+ * wake_up_new_task BEFORE hook.
+ *
+ * Prototype: void wake_up_new_task(struct task_struct *p)
+ *
+ * This fires BEFORE the child is made runnable. At this point:
+ *   - Child's mm is fully constructed (page tables copied from parent)
+ *   - Child's PID is allocated
+ *   - Child is NOT yet scheduled (zero race condition!)
+ *   - `current` = parent (Zygote)
+ *   - fargs->arg0 = child task_struct *
+ *
+ * This is the perfect injection point: we install the ghost page and
+ * the child starts executing with the hook already in place.
+ */
+static void before_wake_up_new_task(hook_fargs4_t *fargs, void *udata)
+{
+    struct task_struct *child_task = (struct task_struct *)fargs->arg0;
+    int parent_pid;
+    int queue_slot;
+    int child_pid_val;
+
+    if (!g_fork.active) return;
+    if (!child_task) return;
+
+    /* Get parent's PID (current = parent context) */
+    parent_pid = 0;
+    if (fn_task_pid_nr_ns)
+        parent_pid = fn_task_pid_nr_ns(current, 0, 0);
+
+    /* Only intercept forks from watched Zygote PIDs */
+    if (!fork_is_watched_parent(parent_pid)) return;
+
+    /* Get child PID for logging/tracking */
+    child_pid_val = 0;
+    if (fn_task_pid_nr_ns)
+        child_pid_val = fn_task_pid_nr_ns(child_task, 0, 0);
+
+    /* Pop next identity slot from queue.
+     * If empty: still inject ghost page (passthrough) to prevent SIGSEGV
+     * from the inherited trampoline at ioctl+0.
+     * identity_idx = -1 means passthrough (no slot_data stamped). */
+    if (fork_queue_empty(&g_fork.queue)) {
+        queue_slot = -1;
+    } else {
+        queue_slot = fork_queue_pop(&g_fork.queue);
+        if (queue_slot < 0 || queue_slot >= FORK_MAX_SLOTS)
+            queue_slot = -1;
+    }
+
+    /* === CRITICAL SECTION: inject BEFORE child is scheduled === */
+
+    /* Install ghost page with shellcode.
+     * queue_slot=-1 → passthrough (template only, no identity stamp) */
+    if (fork_inject_ghost(child_task, queue_slot) == 0) {
+        if (queue_slot >= 0)
+            g_fork.forks_intercepted++;
+        else
+            g_fork.forks_skipped++;
+        pr_info("fork_handler: injected ghost in child pid=%d slot=%d "
+                 "(pre-schedule, ZERO race)\n", child_pid_val, queue_slot);
+    } else {
+        pr_err("fork_handler: ghost inject FAILED pid=%d\n", child_pid_val);
+        g_fork.forks_skipped++;
+        return;
+    }
+
+    /* 2. Patch ART heap Build.* fields (CoW per-child) — only for queued forks */
+    if (queue_slot >= 0)
+        fork_patch_art_heap(child_task, queue_slot);
+
+    /* 3. Property page PTE isolation (per-child private pages) */
+    if (queue_slot >= 0)
+        fork_prop_isolate(child_task, queue_slot);
+}
+
+static void after_wake_up_new_task(hook_fargs4_t *fargs, void *udata) { }
+
+/*
+ * do_exit AFTER hook — cleanup ghost pages when hooked processes exit.
+ *
+ * do_exit prototype: void __noreturn do_exit(long code)
+ * `current` = the task that is exiting.
+ */
+static void before_do_exit(hook_fargs4_t *fargs, void *udata)
+{
+    int pid, slot;
+
+    pid = 0;
+    if (fn_task_pid_nr_ns)
+        pid = fn_task_pid_nr_ns(current, 0, 0);
+    if (!pid) return;
+
+    /* CoW-based prop isolation: kernel handles page cleanup automatically */
+
+    if (!g_fork.active && g_fork.num_active_children == 0) return;
+
+    slot = fork_find_child_by_pid(pid);
+    if (slot < 0) return;
+
+    /* Free the ghost page and release the slot */
+    if (g_fork.children[slot].phys_page) {
+        fn_free_pages(g_fork.children[slot].phys_page, g_fork.ghost_order);
+    }
+    g_fork.children[slot].active = 0;
+    g_fork.children[slot].child_pid = 0;
+    g_fork.children[slot].phys_page = 0;
+    g_fork.num_active_children--;
+    g_fork.children_reaped++;
+
+    pr_info("fork_handler: reaped child pid=%d slot=%d\n", pid, slot);
+}
+
+static void after_do_exit(hook_fargs4_t *fargs, void *udata) { }
+
+/* ---------- Fork Handler Commands ---------- */
+
+/*
+ * fork-setup <zygote_pid> <ghost_va> <ghost_size>
+ * Initialize fork handler config with Zygote info.
+ */
+static int cmd_fork_setup(int zygote_pid, unsigned long ghost_va,
+                           unsigned long ghost_size, char *buf, int bsize)
+{
+    int off = 0;
+    struct task_struct *ztask;
+    struct mm_struct *zmm;
+    struct pte_op pop;
+    int r;
+
+    off += snprintf(buf + off, bsize - off,
+                     "=== FORK-SETUP ===\n"
+                     "zygote=%d ghost_va=0x%lx size=%lu\n\n",
+                     zygote_pid, ghost_va, ghost_size);
+
+    /* Validate Zygote PID */
+    ztask = find_task(zygote_pid);
+    if (!ztask)
+        return off + snprintf(buf + off, bsize - off, "[FAIL] zygote task\n");
+
+    zmm = fn_get_task_mm(ztask);
+    if (!zmm)
+        return off + snprintf(buf + off, bsize - off, "[FAIL] zygote mm\n");
+
+    /* Read PTE template from Zygote's address space near ghost_va.
+     * We need a mapped exec page to copy permission bits from. */
+    pop.mode = 0;
+    pop.out_val = &g_fork.pte_template;
+    r = fn_apply_to_page_range(zmm, ghost_va & ~0xFFFUL, 0x1000,
+                                pte_op_cb, &pop);
+    if (r || !(g_fork.pte_template & 1UL)) {
+        /* ghost_va itself may not be mapped yet. Try using a libc page.
+         * Scan backwards from ghost_va for a valid page. */
+        unsigned long scan;
+        int found = 0;
+        for (scan = ghost_va - 0x1000; scan > ghost_va - 0x100000; scan -= 0x1000) {
+            pop.mode = 0;
+            pop.out_val = &g_fork.pte_template;
+            r = fn_apply_to_page_range(zmm, scan, 0x1000, pte_op_cb, &pop);
+            if (!r && (g_fork.pte_template & 1UL)) {
+                found = 1;
+                off += snprintf(buf + off, bsize - off,
+                                 "[INFO] PTE template from 0x%lx\n", scan);
+                break;
+            }
+        }
+        if (!found) {
+            fn_mmput(zmm);
+            return off + snprintf(buf + off, bsize - off,
+                                   "[FAIL] no PTE template found\n");
+        }
+    }
+
+    fn_mmput(zmm);
+
+    /* Store config */
+    g_fork.ghost_va = ghost_va;
+    g_fork.ghost_size = ghost_size;
+    g_fork.ghost_order = 0;
+    while ((1UL << (12 + g_fork.ghost_order)) < ghost_size)
+        g_fork.ghost_order++;
+
+    /* Register Zygote as watched PID (avoid duplicates) */
+    if (!fork_is_watched_parent(zygote_pid)) {
+        if (g_fork.num_watched < FORK_MAX_WATCHED_PIDS) {
+            g_fork.watched_pids[g_fork.num_watched++] = zygote_pid;
+        }
+    }
+
+    off += snprintf(buf + off, bsize - off,
+                     "[OK] fork-setup complete\n"
+                     "  pte_template=0x%llx\n"
+                     "  ghost_order=%d (%lu bytes)\n"
+                     "  watched_pids=%d (total %d)\n",
+                     (unsigned long long)g_fork.pte_template,
+                     g_fork.ghost_order, 1UL << (12 + g_fork.ghost_order),
+                     zygote_pid, g_fork.num_watched);
+    return off;
+}
+
+/*
+ * fork-template <hex_shellcode>
+ * Upload shellcode template (may need multiple calls for large payloads).
+ */
+static int cmd_fork_template(const char *hex, int offset, char *buf, int bsize)
+{
+    int off = 0;
+    int byte_count = 0;
+    const char *p = hex;
+    uint8_t *dst;
+
+    if (offset < 0 || offset >= FORK_TEMPLATE_MAX)
+        return snprintf(buf, bsize, "[FAIL] offset out of range\n");
+
+    dst = g_fork.code_template + offset;
+    while (*p && *(p+1) && (offset + byte_count) < FORK_TEMPLATE_MAX) {
+        unsigned int b = 0;
+        char hi = *p++, lo = *p++;
+        if (hi >= '0' && hi <= '9') b = (hi - '0') << 4;
+        else if (hi >= 'a' && hi <= 'f') b = (hi - 'a' + 10) << 4;
+        else if (hi >= 'A' && hi <= 'F') b = (hi - 'A' + 10) << 4;
+        else break;
+        if (lo >= '0' && lo <= '9') b |= (lo - '0');
+        else if (lo >= 'a' && lo <= 'f') b |= (lo - 'a' + 10);
+        else if (lo >= 'A' && lo <= 'F') b |= (lo - 'A' + 10);
+        else break;
+        *dst++ = (uint8_t)b;
+        byte_count++;
+    }
+
+    if (offset + byte_count > g_fork.code_len)
+        g_fork.code_len = offset + byte_count;
+
+    off += snprintf(buf + off, bsize - off,
+                     "[OK] fork-template: wrote %d bytes at offset %d "
+                     "(total code_len=%d)\n",
+                     byte_count, offset, g_fork.code_len);
+    return off;
+}
+
+/*
+ * fork-identity <slot> <field> <value>
+ * Set a specific identity field for a sandbox slot.
+ * field: model|brand|android_id|imei|fingerprint
+ */
+static int cmd_fork_identity(int slot, const char *field, const char *value,
+                              char *buf, int bsize)
+{
+    struct sandbox_identity *id;
+
+    if (slot < 0 || slot >= FORK_MAX_SLOTS)
+        return snprintf(buf, bsize, "[FAIL] slot %d out of range\n", slot);
+
+    id = &g_fork.identities[slot];
+
+    if (str_starts_with(field, "model")) {
+        int i;
+        for (i = 0; value[i] && i < FORK_IDENTITY_MODEL_LEN - 1; i++)
+            id->model[i] = value[i];
+        id->model[i] = 0;
+    } else if (str_starts_with(field, "brand")) {
+        int i;
+        for (i = 0; value[i] && i < FORK_IDENTITY_BRAND_LEN - 1; i++)
+            id->brand[i] = value[i];
+        id->brand[i] = 0;
+    } else if (str_starts_with(field, "android_id")) {
+        int i;
+        for (i = 0; value[i] && i < FORK_IDENTITY_AID_LEN - 1; i++)
+            id->android_id[i] = value[i];
+        id->android_id[i] = 0;
+    } else if (str_starts_with(field, "imei")) {
+        int i;
+        for (i = 0; value[i] && i < FORK_IDENTITY_IMEI_LEN - 1; i++)
+            id->imei[i] = value[i];
+        id->imei[i] = 0;
+    } else if (str_starts_with(field, "fingerprint")) {
+        int i;
+        for (i = 0; value[i] && i < 127; i++)
+            id->fingerprint[i] = value[i];
+        id->fingerprint[i] = 0;
+    } else {
+        return snprintf(buf, bsize, "[FAIL] unknown field: %s\n", field);
+    }
+
+    id->configured = 1;
+    return snprintf(buf, bsize, "[OK] slot[%d].%s = %s\n", slot, field, value);
+}
+
+/*
+ * fork-identity-offset <offset>
+ * Set the byte offset in shellcode template where identity struct starts.
+ */
+static int cmd_fork_identity_offset(int offset, char *buf, int bsize)
+{
+    g_fork.identity_offset = offset;
+    return snprintf(buf, bsize, "[OK] identity_offset=%d\n", offset);
+}
+
+/*
+ * fork-slot-data <slot> <byte_offset_in_blob> <hex>
+ * Upload raw pre-encoded binary identity data for a slot.
+ * Python encodes the UTF-16LE + UTF-8 patterns and sends them here.
+ */
+static int cmd_fork_slot_data(int slot, int blob_off, const char *hex,
+                               char *buf, int bsize)
+{
+    int byte_count = 0, end;
+    const char *p = hex;
+    uint8_t *dst;
+
+    if (slot < 0 || slot >= FORK_MAX_SLOTS)
+        return snprintf(buf, bsize, "[FAIL] slot %d out of range\n", slot);
+
+    if (blob_off < 0 || blob_off >= FORK_SLOT_DATA_MAX)
+        return snprintf(buf, bsize, "[FAIL] blob_off %d out of range\n", blob_off);
+
+    dst = g_fork.slot_data[slot] + blob_off;
+    while (*p && *(p+1) && (blob_off + byte_count) < FORK_SLOT_DATA_MAX) {
+        unsigned int b = 0;
+        char hi = *p++, lo = *p++;
+        if (hi >= '0' && hi <= '9') b = (hi - '0') << 4;
+        else if (hi >= 'a' && hi <= 'f') b = (hi - 'a' + 10) << 4;
+        else if (hi >= 'A' && hi <= 'F') b = (hi - 'A' + 10) << 4;
+        else break;
+        if (lo >= '0' && lo <= '9') b |= (lo - '0');
+        else if (lo >= 'a' && lo <= 'f') b |= (lo - 'a' + 10);
+        else if (lo >= 'A' && lo <= 'F') b |= (lo - 'A' + 10);
+        else break;
+        *dst++ = (uint8_t)b;
+        byte_count++;
+    }
+
+    end = blob_off + byte_count;
+    if (end > g_fork.slot_data_len[slot])
+        g_fork.slot_data_len[slot] = end;
+
+    return snprintf(buf, bsize, "[OK] slot[%d] data: off=%d +%d bytes (total=%d)\n",
+                     slot, blob_off, byte_count, g_fork.slot_data_len[slot]);
+}
+
+/*
+ * fork-art-heap <model_addr> <brand_addr> <fp_addr> <hdr_size>
+ * Configure ART heap addresses for Build.* String patching.
+ */
+static int cmd_fork_art_heap(unsigned long model, unsigned long brand,
+                              unsigned long fp, int hdr_size,
+                              char *buf, int bsize)
+{
+    g_fork.art_heap.model_addr = model;
+    g_fork.art_heap.brand_addr = brand;
+    g_fork.art_heap.fingerprint_addr = fp;
+    g_fork.art_heap.string_header_size = hdr_size;
+    g_fork.art_heap.configured = 1;
+    return snprintf(buf, bsize,
+                     "[OK] art_heap: model=0x%lx brand=0x%lx fp=0x%lx hdr=%d\n",
+                     model, brand, fp, hdr_size);
+}
+
+/*
+ * fork-queue <slot_id>
+ * Enqueue a sandbox slot for the next Zygote fork.
+ */
+static int cmd_fork_queue(int slot_id, char *buf, int bsize)
+{
+    if (slot_id < 0 || slot_id >= FORK_MAX_SLOTS)
+        return snprintf(buf, bsize, "[FAIL] slot %d out of range\n", slot_id);
+    if (!g_fork.identities[slot_id].configured)
+        return snprintf(buf, bsize,
+                         "[WARN] slot %d not configured, queuing anyway\n"
+                         "[OK] queued slot=%d depth=%d\n",
+                         slot_id, slot_id, g_fork.queue.count + 1);
+    if (fork_queue_push(&g_fork.queue, slot_id))
+        return snprintf(buf, bsize, "[FAIL] queue full\n");
+    return snprintf(buf, bsize, "[OK] queued slot=%d depth=%d\n",
+                     slot_id, g_fork.queue.count);
+}
+
+/*
+ * fork-arm: activate the fork hook.
+ */
+static int cmd_fork_arm(char *buf, int bsize)
+{
+    hook_err_t herr;
+    int off = 0;
+
+    if (g_fork.active)
+        return snprintf(buf, bsize, "[INFO] already armed\n");
+
+    if (!addr_wake_up_new_task)
+        return snprintf(buf, bsize, "[FAIL] wake_up_new_task not resolved\n");
+
+    if (g_fork.ghost_va == 0 || g_fork.code_len == 0)
+        return snprintf(buf, bsize,
+                         "[FAIL] not configured (run fork-setup + fork-template first)\n");
+
+    /* Hook wake_up_new_task (BEFORE callback = pre-schedule injection) */
+    if (!g_fork.hook_installed) {
+        herr = hook_wrap4(addr_wake_up_new_task,
+                           before_wake_up_new_task, after_wake_up_new_task, 0);
+        if (herr) {
+            off += snprintf(buf + off, bsize - off,
+                             "[FAIL] hook_wrap4 wake_up_new_task: %d\n",
+                             (int)herr);
+            return off;
+        }
+        g_fork.hook_installed = 1;
+        off += snprintf(buf + off, bsize - off,
+                         "[PASS] wake_up_new_task hooked (pre-schedule)\n");
+    }
+
+    /* Hook do_exit for auto-cleanup */
+    if (!g_fork.exit_hook_installed && addr_do_exit) {
+        herr = hook_wrap4(addr_do_exit,
+                           before_do_exit, after_do_exit, 0);
+        if (herr) {
+            off += snprintf(buf + off, bsize - off,
+                             "[WARN] hook_wrap4 do_exit failed: %d "
+                             "(cleanup will be manual)\n", (int)herr);
+        } else {
+            g_fork.exit_hook_installed = 1;
+            off += snprintf(buf + off, bsize - off,
+                             "[PASS] do_exit hooked (auto-cleanup)\n");
+        }
+    }
+
+    /* Allocate shared passthrough page (template with zero'd identity data).
+     * All un-queued Zygote children share this single physical page. */
+    if (!g_fork.passthrough_kpage && g_fork.code_len > 0) {
+        g_fork.passthrough_kpage = fn_get_free_pages(GFP_KERNEL_FLAG, 0);
+        if (g_fork.passthrough_kpage) {
+            memcpy((void *)g_fork.passthrough_kpage,
+                   g_fork.code_template, g_fork.code_len);
+            g_fork.passthrough_pa = kva_to_pa_at(g_fork.passthrough_kpage);
+            /* I-cache coherency for shared page */
+            {
+                unsigned long a;
+                for (a = g_fork.passthrough_kpage;
+                     a < g_fork.passthrough_kpage + 0x1000; a += 64)
+                    asm volatile("dc cvau, %0" :: "r"(a));
+                asm volatile("dsb ish; ic ialluis; dsb ish; isb" ::: "memory");
+            }
+            off += snprintf(buf + off, bsize - off,
+                             "[PASS] shared passthrough page allocated "
+                             "(pa=0x%lx)\n", g_fork.passthrough_pa);
+        }
+    }
+
+    g_fork.active = 1;
+    off += snprintf(buf + off, bsize - off,
+                     "[OK] fork handler ARMED\n"
+                     "  watched_pids: %d\n"
+                     "  ghost_va: 0x%lx\n"
+                     "  code_len: %d\n"
+                     "  queue_depth: %d\n",
+                     g_fork.num_watched, g_fork.ghost_va,
+                     g_fork.code_len, g_fork.queue.count);
+    return off;
+}
+
+/*
+ * fork-disarm: deactivate the fork hook.
+ */
+static int cmd_fork_disarm(char *buf, int bsize)
+{
+    int off = 0;
+
+    g_fork.active = 0;
+
+    if (g_fork.hook_installed && addr_wake_up_new_task) {
+        hook_unwrap(addr_wake_up_new_task,
+                     before_wake_up_new_task, after_wake_up_new_task);
+        g_fork.hook_installed = 0;
+        off += snprintf(buf + off, bsize - off,
+                         "[PASS] wake_up_new_task unhooked\n");
+    }
+
+    if (g_fork.exit_hook_installed && addr_do_exit) {
+        hook_unwrap(addr_do_exit, before_do_exit, after_do_exit);
+        g_fork.exit_hook_installed = 0;
+        off += snprintf(buf + off, bsize - off,
+                         "[PASS] do_exit unhooked\n");
+    }
+
+    off += snprintf(buf + off, bsize - off, "[OK] fork handler DISARMED\n");
+    return off;
+}
+
+/*
+ * fork-stat: show fork handler state.
+ */
+static int cmd_fork_stat(char *buf, int bsize)
+{
+    int off = 0;
+    int i;
+
+    off += snprintf(buf + off, bsize - off,
+                     "=== FORK HANDLER STATUS ===\n"
+                     "active: %d\n"
+                     "hook_installed: %d\n"
+                     "exit_hook: %d\n"
+                     "ghost_va: 0x%lx\n"
+                     "ghost_size: %lu (order=%d)\n"
+                     "code_len: %d\n"
+                     "identity_offset: %d\n"
+                     "queue_depth: %d\n"
+                     "forks_intercepted: %lu\n"
+                     "forks_skipped: %lu\n"
+                     "children_reaped: %lu\n"
+                     "active_children: %d\n\n",
+                     g_fork.active, g_fork.hook_installed,
+                     g_fork.exit_hook_installed,
+                     g_fork.ghost_va, g_fork.ghost_size, g_fork.ghost_order,
+                     g_fork.code_len, g_fork.identity_offset,
+                     g_fork.queue.count,
+                     g_fork.forks_intercepted, g_fork.forks_skipped,
+                     g_fork.children_reaped, g_fork.num_active_children);
+
+    off += snprintf(buf + off, bsize - off, "watched_pids:");
+    for (i = 0; i < g_fork.num_watched && off < bsize - 20; i++)
+        off += snprintf(buf + off, bsize - off, " %d", g_fork.watched_pids[i]);
+    off += snprintf(buf + off, bsize - off, "\n\n");
+
+    /* Active children + ghost page data counters */
+    off += snprintf(buf + off, bsize - off, "children:\n");
+    for (i = 0; i < FORK_MAX_SLOTS && off < bsize - 300; i++) {
+        unsigned long kva;
+        if (!g_fork.children[i].active) continue;
+        kva = g_fork.children[i].ghost_kaddr;
+        off += snprintf(buf + off, bsize - off,
+                         "  [%d] pid=%d identity=%d",
+                         i, g_fork.children[i].child_pid,
+                         g_fork.children[i].identity_idx);
+        /* Read Binder counters from the ghost page's data section.
+         * Offsets must match the Python deployer's layout constants. */
+        if (kva && g_fork.identity_offset > 0) {
+            uint64_t *data = (uint64_t *)(kva + 0x300);
+            off += snprintf(buf + off, bsize - off,
+                " binder=%llu replace=%llu br_reply=%llu scan_hit=%llu",
+                data[0], data[1], data[2], data[5]);
+        }
+        off += snprintf(buf + off, bsize - off, "\n");
+    }
+
+    /* Configured identities */
+    off += snprintf(buf + off, bsize - off, "\nidentities:\n");
+    for (i = 0; i < FORK_MAX_SLOTS && off < bsize - 120; i++) {
+        if (!g_fork.identities[i].configured) continue;
+        off += snprintf(buf + off, bsize - off,
+                         "  [%d] model=%s brand=%s aid=%s\n",
+                         i, g_fork.identities[i].model,
+                         g_fork.identities[i].brand,
+                         g_fork.identities[i].android_id);
+    }
+
+    return off;
+}
+
+/*
+ * fork-cleanup <pid>: manually free a child's ghost page.
+ */
+static int cmd_fork_cleanup(int pid, char *buf, int bsize)
+{
+    int slot = fork_find_child_by_pid(pid);
+    if (slot < 0)
+        return snprintf(buf, bsize, "[FAIL] pid %d not in children table\n", pid);
+
+    if (g_fork.children[slot].phys_page)
+        fn_free_pages(g_fork.children[slot].phys_page, g_fork.ghost_order);
+
+    g_fork.children[slot].active = 0;
+    g_fork.children[slot].child_pid = 0;
+    g_fork.children[slot].phys_page = 0;
+    g_fork.num_active_children--;
+    g_fork.children_reaped++;
+
+    return snprintf(buf, bsize, "[OK] freed slot=%d pid=%d\n", slot, pid);
+}
+
+/* ---------- Property Isolation Commands ---------- */
+
+/*
+ * prop-ctx-add <va_hex> <num_pages> <p0> [p1 p2 ...]
+ * Register a property context for PTE replacement.
+ */
+static int cmd_prop_ctx_add(const char *args, char *buf, int bsize)
+{
+    const char *p = args;
+    unsigned long va;
+    int n, i;
+    struct prop_ctx_info *ctx;
+
+    if (g_prop.ctx_count >= PROP_MAX_CTX)
+        return snprintf(buf, bsize, "[FAIL] max contexts reached\n");
+
+    va = parse_num(&p);
+    while (*p == ' ') p++;
+    n = (int)parse_num(&p);
+    if (n <= 0 || n > PROP_MAX_PAGES_CTX)
+        return snprintf(buf, bsize, "[FAIL] bad num_pages=%d\n", n);
+
+    ctx = &g_prop.contexts[g_prop.ctx_count];
+    ctx->va_start = va;
+    ctx->num_pages = n;
+    ctx->template_base = g_prop.total_pages;
+
+    for (i = 0; i < n; i++) {
+        while (*p == ' ') p++;
+        ctx->page_indices[i] = (int)parse_num(&p);
+    }
+
+    g_prop.total_pages += n;
+    g_prop.ctx_count++;
+
+    return snprintf(buf, bsize, "[OK] ctx[%d] va=0x%lx pages=%d base=%d total=%d\n",
+                     g_prop.ctx_count - 1, va, n, ctx->template_base, g_prop.total_pages);
+}
+
+/*
+ * prop-init <zygote_pid>
+ * Read base pages from Zygote memory and allocate templates for all 8 slots.
+ * Also reads PTE template from the first context's first page.
+ */
+static int cmd_prop_init(int zygote_pid, char *buf, int bsize)
+{
+    int off = 0, ci, pi, si, tmpl_idx;
+    struct task_struct *ztask;
+    struct mm_struct *zmm;
+    static uint8_t page_buf[4096];
+
+    if (g_prop.ctx_count == 0)
+        return snprintf(buf, bsize, "[FAIL] no contexts registered\n");
+    if (g_prop.total_pages > PROP_MAX_PAGES)
+        return snprintf(buf, bsize, "[FAIL] total_pages=%d > max=%d\n",
+                         g_prop.total_pages, PROP_MAX_PAGES);
+
+    ztask = find_task(zygote_pid);
+    if (!ztask)
+        return snprintf(buf, bsize, "[FAIL] zygote task pid=%d\n", zygote_pid);
+
+    zmm = fn_get_task_mm(ztask);
+    if (!zmm)
+        return snprintf(buf, bsize, "[FAIL] zygote mm\n");
+
+    /* For each context, read relevant pages from Zygote and allocate slot 0 template. */
+    for (ci = 0; ci < g_prop.ctx_count; ci++) {
+        struct prop_ctx_info *ctx = &g_prop.contexts[ci];
+        for (pi = 0; pi < ctx->num_pages; pi++) {
+            unsigned long va = ctx->va_start + (unsigned long)ctx->page_indices[pi] * 4096;
+            unsigned long kpage;
+            int rd;
+
+            tmpl_idx = ctx->template_base + pi;
+
+            rd = fn_access_process_vm(ztask, va, page_buf, 4096, 0);
+            if (rd != 4096) {
+                off += snprintf(buf + off, bsize - off,
+                                 "[WARN] ctx[%d] pg[%d] read=%d\n", ci, pi, rd);
+                continue;
+            }
+
+            kpage = fn_get_free_pages(GFP_KERNEL_FLAG, 0);
+            if (!kpage) {
+                off += snprintf(buf + off, bsize - off,
+                                 "[FAIL] alloc ctx[%d] pg[%d]\n", ci, pi);
+                continue;
+            }
+            memcpy((void *)kpage, page_buf, 4096);
+            g_prop.templates[0][tmpl_idx] = kpage;
+        }
+    }
+
+    fn_mmput(zmm);
+
+    /* Clone slot 0 to slots 1-7 */
+    for (si = 1; si < FORK_MAX_SLOTS; si++) {
+        for (tmpl_idx = 0; tmpl_idx < g_prop.total_pages; tmpl_idx++) {
+            unsigned long src = g_prop.templates[0][tmpl_idx];
+            unsigned long kpage;
+            if (!src) continue;
+            kpage = fn_get_free_pages(GFP_KERNEL_FLAG, 0);
+            if (!kpage) {
+                off += snprintf(buf + off, bsize - off,
+                                 "[FAIL] clone slot=%d idx=%d\n", si, tmpl_idx);
+                continue;
+            }
+            memcpy((void *)kpage, (void *)src, 4096);
+            g_prop.templates[si][tmpl_idx] = kpage;
+        }
+    }
+
+    off += snprintf(buf + off, bsize - off,
+                     "[OK] prop-init: %d contexts, %d pages/slot, 8 slots allocated\n",
+                     g_prop.ctx_count, g_prop.total_pages);
+    return off;
+}
+
+/*
+ * prop-delta <slot> <tmpl_idx> <offset_in_page> <hex_bytes>
+ * Apply a value change to a specific template page.
+ */
+static int cmd_prop_delta(const char *args, char *buf, int bsize)
+{
+    const char *p = args;
+    int slot, tmpl_idx, offset, byte_len;
+    unsigned long kpage;
+    static uint8_t delta_buf[256];
+
+    slot = (int)parse_num(&p);
+    while (*p == ' ') p++;
+    tmpl_idx = (int)parse_num(&p);
+    while (*p == ' ') p++;
+    offset = (int)parse_num(&p);
+    while (*p == ' ') p++;
+
+    if (slot < 0 || slot >= FORK_MAX_SLOTS)
+        return snprintf(buf, bsize, "[FAIL] bad slot=%d\n", slot);
+    if (tmpl_idx < 0 || tmpl_idx >= g_prop.total_pages)
+        return snprintf(buf, bsize, "[FAIL] bad idx=%d\n", tmpl_idx);
+
+    kpage = g_prop.templates[slot][tmpl_idx];
+    if (!kpage)
+        return snprintf(buf, bsize, "[FAIL] no template at slot=%d idx=%d\n",
+                         slot, tmpl_idx);
+
+    byte_len = hex_to_bytes(p, delta_buf, sizeof(delta_buf));
+    if (byte_len <= 0)
+        return snprintf(buf, bsize, "[FAIL] bad hex\n");
+    if (offset + byte_len > 4096)
+        return snprintf(buf, bsize, "[FAIL] overflow off=%d+len=%d\n",
+                         offset, byte_len);
+
+    memcpy((uint8_t *)kpage + offset, delta_buf, byte_len);
+
+    return snprintf(buf, bsize, "[OK] delta slot=%d idx=%d off=%d len=%d\n",
+                     slot, tmpl_idx, offset, byte_len);
+}
+
+/*
+ * prop-commit: mark templates as ready for fork-time PTE replacement.
+ */
+static int cmd_prop_commit(char *buf, int bsize)
+{
+    int si, ti, ok = 0;
+
+    for (si = 0; si < FORK_MAX_SLOTS; si++)
+        for (ti = 0; ti < g_prop.total_pages; ti++)
+            if (g_prop.templates[si][ti]) ok++;
+
+    if (ok == 0)
+        return snprintf(buf, bsize, "[FAIL] no templates loaded\n");
+
+    g_prop.ready = 1;
+    return snprintf(buf, bsize,
+                     "[OK] prop COMMITTED: %d contexts, %d pages/slot, "
+                     "%d/%d template pages loaded\n",
+                     g_prop.ctx_count, g_prop.total_pages,
+                     ok, g_prop.total_pages * FORK_MAX_SLOTS);
+}
+
+/*
+ * prop-status: show property isolation state.
+ */
+static int cmd_prop_status(char *buf, int bsize)
+{
+    int off = 0, ci, si, ti;
+
+    off += snprintf(buf + off, bsize - off,
+                     "=== PROP CoW ISOLATION ===\n"
+                     "ready: %d\n"
+                     "contexts: %d\n"
+                     "pages/slot: %d\n"
+                     "installs: %lu\n\n",
+                     g_prop.ready, g_prop.ctx_count, g_prop.total_pages,
+                     g_prop.installs);
+
+    for (ci = 0; ci < g_prop.ctx_count && off < bsize - 100; ci++) {
+        struct prop_ctx_info *ctx = &g_prop.contexts[ci];
+        off += snprintf(buf + off, bsize - off,
+                         "  ctx[%d] va=0x%lx pages=%d base=%d indices=",
+                         ci, ctx->va_start, ctx->num_pages, ctx->template_base);
+        {
+            int pi;
+            for (pi = 0; pi < ctx->num_pages && off < bsize - 20; pi++)
+                off += snprintf(buf + off, bsize - off, "%d ", ctx->page_indices[pi]);
+        }
+        off += snprintf(buf + off, bsize - off, "\n");
+    }
+
+    off += snprintf(buf + off, bsize - off, "\ntemplates loaded:\n");
+    for (si = 0; si < FORK_MAX_SLOTS && off < bsize - 80; si++) {
+        int cnt = 0;
+        for (ti = 0; ti < g_prop.total_pages; ti++)
+            if (g_prop.templates[si][ti]) cnt++;
+        off += snprintf(buf + off, bsize - off, "  slot[%d]: %d/%d\n",
+                         si, cnt, g_prop.total_pages);
+    }
+
+    return off;
+}
+
+/*
+ * prop-clear: reset all property isolation state, free template pages.
+ */
+static int cmd_prop_clear(char *buf, int bsize)
+{
+    int si, ti, freed = 0;
+
+    g_prop.ready = 0;
+
+    for (si = 0; si < FORK_MAX_SLOTS; si++) {
+        for (ti = 0; ti < PROP_MAX_PAGES; ti++) {
+            if (g_prop.templates[si][ti]) {
+                fn_free_pages(g_prop.templates[si][ti], 0);
+                g_prop.templates[si][ti] = 0;
+                freed++;
+            }
+        }
+    }
+
+    g_prop.ctx_count = 0;
+    g_prop.total_pages = 0;
+
+    return snprintf(buf, bsize, "[OK] prop-clear: freed %d template pages\n", freed);
+}
+
+/* ========== END FORK HANDLER ========== */
+
 /* ---------- KPM entry points ---------- */
 
 static long planc2_init(const char *args, const char *event, void *__user r)
@@ -2066,6 +3261,18 @@ static long planc2_init(const char *args, const char *event, void *__user r)
     fn_on_each_cpu         = (on_each_cpu_t)kallsyms_lookup_name("on_each_cpu");
     fn_smp_call_function   = (smp_call_function_t)kallsyms_lookup_name("smp_call_function");
     fn_send_sig            = (send_sig_t)kallsyms_lookup_name("send_sig");
+
+    /* Fork handler: resolve symbols (no hooks installed at init — safe) */
+    addr_wake_up_new_task = (void *)kallsyms_lookup_name("wake_up_new_task");
+    if (!addr_wake_up_new_task)
+        addr_wake_up_new_task = (void *)kallsyms_lookup_name("wake_up_new_task.isra.0");
+    addr_do_exit = (void *)kallsyms_lookup_name("do_exit");
+
+    pr_info("ptehook-planc-v2: fork_handler syms: wunt=%lx do_exit=%lx "
+             "(sizeof g_fork=%lu)\n",
+             (unsigned long)addr_wake_up_new_task,
+             (unsigned long)addr_do_exit,
+             (unsigned long)sizeof(g_fork));
 
     /* Detect kernel layout (maple tree vs linked list VMAs) */
     probe_kern_layout();
@@ -2446,6 +3653,122 @@ static long planc2_ctl0(const char *args, char *__user out_msg, int outlen)
     else if (str_starts_with(p, "stat")) {
         off = cmd_stat(buf, sizeof(buf));
     }
+    /* ===== Fork Handler Commands ===== */
+    else if (str_starts_with(p, "fork-setup")) {
+        int zpid;
+        unsigned long gva, gsz;
+        p += 10;
+        while (*p == ' ' || *p == '\t') p++;
+        zpid = (int)parse_num(&p);
+        while (*p == ' ' || *p == '\t') p++;
+        gva = parse_num(&p);
+        while (*p == ' ' || *p == '\t') p++;
+        gsz = parse_num(&p);
+        off = cmd_fork_setup(zpid, gva, gsz, buf, sizeof(buf));
+    }
+    else if (str_starts_with(p, "fork-template")) {
+        int tmpl_off = 0;
+        p += 13;
+        while (*p == ' ' || *p == '\t') p++;
+        tmpl_off = (int)parse_num(&p);
+        while (*p == ' ' || *p == '\t') p++;
+        off = cmd_fork_template(p, tmpl_off, buf, sizeof(buf));
+    }
+    else if (str_starts_with(p, "fork-slot-data")) {
+        int sd_slot, sd_off;
+        p += 14;
+        while (*p == ' ' || *p == '\t') p++;
+        sd_slot = (int)parse_num(&p);
+        while (*p == ' ' || *p == '\t') p++;
+        sd_off = (int)parse_num(&p);
+        while (*p == ' ' || *p == '\t') p++;
+        off = cmd_fork_slot_data(sd_slot, sd_off, p, buf, sizeof(buf));
+    }
+    else if (str_starts_with(p, "fork-identity-offset")) {
+        int idoff;
+        p += 20;
+        while (*p == ' ' || *p == '\t') p++;
+        idoff = (int)parse_num(&p);
+        off = cmd_fork_identity_offset(idoff, buf, sizeof(buf));
+    }
+    else if (str_starts_with(p, "fork-identity")) {
+        int slot;
+        char field[32];
+        int fi = 0;
+        p += 13;
+        while (*p == ' ' || *p == '\t') p++;
+        slot = (int)parse_num(&p);
+        while (*p == ' ' || *p == '\t') p++;
+        while (*p && *p != ' ' && *p != '\t' && fi < 31)
+            field[fi++] = *p++;
+        field[fi] = 0;
+        while (*p == ' ' || *p == '\t') p++;
+        off = cmd_fork_identity(slot, field, p, buf, sizeof(buf));
+    }
+    else if (str_starts_with(p, "fork-art-heap")) {
+        unsigned long model_a, brand_a, fp_a;
+        int hdr;
+        p += 13;
+        while (*p == ' ' || *p == '\t') p++;
+        model_a = parse_num(&p);
+        while (*p == ' ' || *p == '\t') p++;
+        brand_a = parse_num(&p);
+        while (*p == ' ' || *p == '\t') p++;
+        fp_a = parse_num(&p);
+        while (*p == ' ' || *p == '\t') p++;
+        hdr = (int)parse_num(&p);
+        off = cmd_fork_art_heap(model_a, brand_a, fp_a, hdr, buf, sizeof(buf));
+    }
+    else if (str_starts_with(p, "fork-queue")) {
+        int slot;
+        p += 10;
+        while (*p == ' ' || *p == '\t') p++;
+        slot = (int)parse_num(&p);
+        off = cmd_fork_queue(slot, buf, sizeof(buf));
+    }
+    else if (str_starts_with(p, "fork-arm")) {
+        off = cmd_fork_arm(buf, sizeof(buf));
+    }
+    else if (str_starts_with(p, "fork-disarm")) {
+        off = cmd_fork_disarm(buf, sizeof(buf));
+    }
+    else if (str_starts_with(p, "fork-stat")) {
+        off = cmd_fork_stat(buf, sizeof(buf));
+    }
+    else if (str_starts_with(p, "fork-cleanup")) {
+        int cpid;
+        p += 12;
+        while (*p == ' ' || *p == '\t') p++;
+        cpid = (int)parse_num(&p);
+        off = cmd_fork_cleanup(cpid, buf, sizeof(buf));
+    }
+    /* ===== Property Isolation Commands ===== */
+    else if (str_starts_with(p, "prop-ctx-add")) {
+        p += 12;
+        while (*p == ' ' || *p == '\t') p++;
+        off = cmd_prop_ctx_add(p, buf, sizeof(buf));
+    }
+    else if (str_starts_with(p, "prop-init")) {
+        int zpid;
+        p += 9;
+        while (*p == ' ' || *p == '\t') p++;
+        zpid = (int)parse_num(&p);
+        off = cmd_prop_init(zpid, buf, sizeof(buf));
+    }
+    else if (str_starts_with(p, "prop-delta")) {
+        p += 10;
+        while (*p == ' ' || *p == '\t') p++;
+        off = cmd_prop_delta(p, buf, sizeof(buf));
+    }
+    else if (str_starts_with(p, "prop-commit")) {
+        off = cmd_prop_commit(buf, sizeof(buf));
+    }
+    else if (str_starts_with(p, "prop-status")) {
+        off = cmd_prop_status(buf, sizeof(buf));
+    }
+    else if (str_starts_with(p, "prop-clear")) {
+        off = cmd_prop_clear(buf, sizeof(buf));
+    }
     else {
         off = snprintf(buf, sizeof(buf),
                         "ptehook Plan C v2 commands:\n"
@@ -2463,8 +3786,14 @@ static long planc2_ctl0(const char *args, char *__user out_msg, int outlen)
                         "  uxn-list\n"
                         "  hide-vma <pid> <vaddr>\n"
                         "  hide-range <pid> <start> <end>\n"
-                        "  remove\n"
-                        "  stat\n");
+                        "  fork-setup / fork-template / fork-identity\n"
+                        "  fork-queue / fork-arm / fork-disarm / fork-stat\n"
+                        "  fork-cleanup <pid>\n"
+                        "  prop-ctx-add <va> <n> <p0> [p1..]\n"
+                        "  prop-init <zygote_pid>\n"
+                        "  prop-delta <slot> <idx> <off> <hex>\n"
+                        "  prop-commit / prop-status / prop-clear\n"
+                        "  remove / stat\n");
     }
 
     buf[off] = '\0';
@@ -2509,6 +3838,12 @@ static void cleanup_all_state(void)
         n_ghost++;
     }
 
+    /* Property isolation template pages */
+    if (g_prop.ctx_count > 0) {
+        cmd_prop_clear(buf, sizeof(buf));
+        pr_info("ptehook-planc-v2: prop templates freed\n");
+    }
+
     pr_info("ptehook-planc-v2: cleanup_all_state uxn=%d java=%d ghost=%d\n",
              n_uxn, n_java, n_ghost);
 }
@@ -2516,7 +3851,27 @@ static void cleanup_all_state(void)
 static long planc2_exit(void *__user r)
 {
     static char buf[512];
+    int i;
     pr_info("ptehook-planc-v2: exit\n");
+
+    /* Disarm fork handler first (unhooks kernel_clone + do_exit) */
+    if (g_fork.hook_installed || g_fork.exit_hook_installed) {
+        cmd_fork_disarm(buf, sizeof(buf));
+    }
+    /* Free all tracked fork-child ghost pages */
+    for (i = 0; i < FORK_MAX_SLOTS; i++) {
+        if (!g_fork.children[i].active) continue;
+        if (g_fork.children[i].phys_page)
+            fn_free_pages(g_fork.children[i].phys_page, g_fork.ghost_order);
+        g_fork.children[i].active = 0;
+    }
+    g_fork.num_active_children = 0;
+    /* Free shared passthrough page */
+    if (g_fork.passthrough_kpage) {
+        fn_free_pages(g_fork.passthrough_kpage, 0);
+        g_fork.passthrough_kpage = 0;
+        g_fork.passthrough_pa = 0;
+    }
 
     /* Clean up per-slot state first (clears PTEs in target mm, frees pages).
      * Must happen BEFORE do_mem_abort hook is removed, because uxn_unhook
