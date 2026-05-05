@@ -2379,7 +2379,10 @@ static void fork_prop_isolate(struct task_struct *child, int slot)
         flags_ptr = (unsigned long *)((char *)vma + OFF_VMA_FLAGS);
         orig_flags = *flags_ptr;
 
-        /* Clear VM_SHARED → forces CoW path instead of shared-page write */
+        /* Convert VMA from MAP_SHARED to MAP_PRIVATE permanently.
+         * This ensures VMA flags and PTE state remain consistent:
+         * both say "private" so the kernel's MM subsystem handles
+         * page lifecycle correctly (no shared+anon PTE mismatch). */
         *flags_ptr = (orig_flags & ~(KVM_SHARED | KVM_MAYSHARE))
                    | KVM_WRITE | KVM_MAYWRITE;
 
@@ -2398,7 +2401,8 @@ static void fork_prop_isolate(struct task_struct *child, int slot)
                 total++;
         }
 
-        *flags_ptr = orig_flags;
+        /* Clear VM_WRITE but keep private — pages are read-only data */
+        *flags_ptr = (orig_flags & ~(KVM_SHARED | KVM_MAYSHARE));
     }
 
     fn_mmput(mm);
